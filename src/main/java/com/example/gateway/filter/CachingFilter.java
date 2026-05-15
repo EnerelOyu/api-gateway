@@ -31,10 +31,11 @@ public class CachingFilter implements GlobalFilter, Ordered {
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
         if (!exchange.getRequest().getMethod().equals(HttpMethod.GET)) {
-            return chain.filter(exchange);
+            return invalidateCache(exchange)
+                .then(chain.filter(exchange));
         }
 
-        String key = exchange.getRequest().getURI().toString();
+        String key = buildCacheKey(exchange);
 
         return redisTemplate.opsForValue().get(key)
             .flatMap(cached -> {
@@ -75,6 +76,50 @@ public class CachingFilter implements GlobalFilter, Ordered {
 
                 return chain.filter(exchange.mutate().response(decorator).build());
             }));
+    }
+
+    private String buildCacheKey(ServerWebExchange exchange) {
+        return "GET:" + exchange.getRequest().getURI().toString();
+    }
+
+    private Mono<Void> invalidateCache(ServerWebExchange exchange) {
+        String resourceKey = buildCacheKey(exchange);
+        String collectionKey = buildCollectionCacheKey(exchange);
+
+        return Flux.just(resourceKey, collectionKey)
+            .filter(key -> key != null)
+            .flatMap(redisTemplate::delete)
+            .then()
+            .doOnSuccess(unused -> System.out.println("Cache INVALIDATE: " + resourceKey + " collection=" + collectionKey))
+            .onErrorResume(ex -> {
+                System.out.println("Cache INVALIDATE FAILED: " + ex.getMessage());
+                return Mono.empty();
+            });
+    }
+
+    private String buildCollectionCacheKey(ServerWebExchange exchange) {
+        String uri = exchange.getRequest().getURI().toString();
+        String path = exchange.getRequest().getURI().getPath();
+        if (path == null || path.isBlank()) {
+            return null;
+        }
+
+        String[] segments = path.split("/");
+        if (segments.length < 2) {
+            return null;
+        }
+
+        String lastSegment = segments[segments.length - 1];
+        if (lastSegment.isBlank()) {
+            return null;
+        }
+
+        String parentPath = uri.substring(0, uri.lastIndexOf('/' + lastSegment));
+        if (parentPath.isEmpty() || parentPath.endsWith("/api")) {
+            return null;
+        }
+
+        return "GET:" + parentPath;
     }
 
     @Override
